@@ -1,0 +1,234 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: CloudFormation template for AWS Config rule with Lambda function and Execution role
+
+Resources:
+  SgPublicAccessCheckLambdaFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Code:
+        ZipFile: |
+            import json
+            import ipaddress
+            import boto3
+
+            # Initialize a session using boto3
+            session = boto3.Session()
+            ec2_client = session.client('ec2')
+
+            def is_public_network(ip):
+                
+                """
+                Determines if a network address is public.
+
+                Args:
+                    address - a network address in CIDR notation.
+                
+                Returns a boolean.
+                """
+                
+                # Note, the ipaddress library had behavior changes in 3.12.4.
+                # If you deploy to older versions of Python, you should understand these changes:
+                # Please review: https://docs.python.org/3/library/ipaddress.html#ipaddress.IPv4Address.is_private
+
+                try:
+                    # In this use case, strict=False allows for non-standard
+                    # CIDR blocks, such as /18.
+                    ip = ipaddress.ip_network(ip, strict=False)
+                
+                except ValueError as e:
+                    raise e
+                
+                return not (
+                    ip.is_private or 
+                    ip.is_loopback or 
+                    ip.is_link_local or 
+                    ip.is_reserved or 
+                    ip.is_multicast or 
+                    ip.is_unspecified
+                )
+
+            def check_prefix_list(prefix_list_id):
+
+                """
+                Check if a given prefix list contains public IP addresses.
+
+                This function inspects the specified prefix list to determine if it contains
+                public IP addresses. Since access from some public IPs is required for interaction
+                with publicly exposed services, prefix lists owned by AWS are skipped.
+
+                Parameters:
+                prefix_list_id (str): The ID of the prefix list to check.
+
+                Returns:
+                bool: True if the prefix list contains public IP addresses, False otherwise.
+
+                Raises:
+                ValueError: If an error occurs during the API calls.
+                """
+                
+                try:
+                    response = ec2_client.describe_managed_prefix_lists(PrefixListIds=[prefix_list_id])
+                    prefix_list = response['PrefixLists'][0]
+                    
+                    if prefix_list['OwnerId'] == 'AWS':
+                        return False
+
+                    response = ec2_client.get_managed_prefix_list_entries(PrefixListId=prefix_list_id)
+                    for entry in response['Entries']:
+                        if is_public_network(entry['Cidr']):
+                            return True
+
+                    return False
+                except ValueError as e:
+                    raise e
+
+
+            def check_security_group(group):
+                
+                """
+                Determines if a security group allows access from public IP address space.
+
+                Args:
+                    group - a security group's information as provided by the `describe_security_group` API.
+
+                Returns compliance information in the form of a dictionary.
+                """
+                
+                if not group['IpPermissions']:
+                    return {
+                        'ComplianceType': 'COMPLIANT',
+                        'Annotation': 'SecurityGroup does not have any rules'
+                    }
+                
+                if len(group['IpPermissions']) == 1 and len(group['IpPermissions'][0]['UserIdGroupPairs']) == 1:
+                    return {
+                        'ComplianceType': 'NOT_APPLICABLE',
+                        'Annotation': 'SecurityGroup allows access to another SecurityGroup'
+                    }
+
+                for permission in group['IpPermissions']:
+                    # Check IPv4 ranges
+                    for ip_range in permission.get('IpRanges', []):
+                        if 'CidrIp' in ip_range and is_public_network(ip_range['CidrIp']):
+                            return {
+                                'ComplianceType': 'NON_COMPLIANT',
+                                'Annotation': 'SecurityGroup allows public IPv4 address(es)'
+                            }
+                        else:
+                            return {
+                                'ComplianceType': 'COMPLIANT',
+                                'Annotation': 'SecurityGroup does not allow public IPv4 address(es)'
+                            }
+                            
+                    # Check IPv6 ranges
+                    for ipv6_range in permission.get('Ipv6Ranges', []):
+                        if 'CidrIpv6' in ipv6_range and is_public_network(ipv6_range['CidrIpv6']):
+                            return {
+                                'ComplianceType': 'NON_COMPLIANT',
+                                'Annotation': 'SecurityGroup allows public IPv6 address(es)'
+                            }
+                        else:
+                            return {
+                                'ComplianceType': 'COMPLIANT',
+                                'Annotation': 'SecurityGroup does not allow public IPv6 address(es)'
+                            }
+
+                    # Check Prefix List IDs
+                    for prefix_list in permission.get('PrefixListIds', []):
+                        prefix_list_id = prefix_list['PrefixListId']
+                        if check_prefix_list(prefix_list_id):
+                            return {
+                                'ComplianceType': 'NON_COMPLIANT',
+                                'Annotation': 'SecurityGroup allows public address(es) listed in prefix list'
+                            }
+                        else:
+                            return {
+                                'ComplianceType': 'COMPLIANT',
+                                'Annotation': 'SecurityGroup does not allow public address(es) listed in prefix list'
+                            }
+
+            def lambda_handler(event, context):
+                invoking_event = json.loads(event['invokingEvent'])
+                notification_creation_time = invoking_event['notificationCreationTime']
+                token = event['resultToken']
+                
+                config_client = boto3.client('config')
+                
+                evaluations = [
+                    {
+                        **check_security_group(group),
+                        'ComplianceResourceType': 'AWS::EC2::SecurityGroup',
+                        'ComplianceResourceId': group['GroupId'],
+                        'OrderingTimestamp': notification_creation_time
+                    }
+                    for group in ec2_client.describe_security_groups()['SecurityGroups']
+                ]
+                
+                config_client.put_evaluations(
+                    Evaluations=evaluations,
+                    ResultToken=token,
+                    TestMode=False
+                )
+
+      Handler: index.lambda_handler
+      Runtime: python3.12
+      Timeout: 120
+      Role: !GetAtt SgPublicAccessCheckLambdaExecutionRole.Arn
+
+  SgPublicAccessCheckLambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: LambdaExecutionPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub 'arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/:*'
+              - Effect: Allow
+                Action:
+                  - config:PutEvaluations
+                  - ec2:DescribeSecurityGroupRules
+                  - ec2:DescribeSecurityGroups
+                  - ec2:DescribeManagedPrefixLists
+                  - ec2:GetManagedPrefixListEntries
+                Resource: '*'
+
+  SgPublicAccessCheckConfigRule:
+    Type: AWS::Config::ConfigRule
+    Properties:
+      ConfigRuleName: SgPublicAccessCheck
+      Description: Security Group public access check
+      EvaluationModes: 
+        - Mode: DETECTIVE
+      Scope: 
+        ComplianceResourceTypes:
+          - AWS::RDS::EC2SecurityGroup
+      Source:
+        Owner: CUSTOM_LAMBDA
+        SourceDetails:
+          - EventSource: aws.config
+            MessageType: ScheduledNotification
+            MaximumExecutionFrequency: TwentyFour_Hours
+        SourceIdentifier: !GetAtt SgPublicAccessCheckLambdaFunction.Arn
+      InputParameters: {}
+    DependsOn: ConfigPermissionToCallLambda
+
+  ConfigPermissionToCallLambda: 
+    Type: AWS::Lambda::Permission
+    Properties: 
+      FunctionName: !GetAtt SgPublicAccessCheckLambdaFunction.Arn
+      Action: lambda:InvokeFunction
+      Principal: config.amazonaws.com
+      SourceAccount: !Ref 'AWS::AccountId' 
