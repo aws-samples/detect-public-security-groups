@@ -214,7 +214,7 @@ Resources:
         - Mode: DETECTIVE
       Scope: 
         ComplianceResourceTypes:
-          - AWS::RDS::EC2SecurityGroup
+          - AWS::EC2::SecurityGroup
       Source:
         Owner: CUSTOM_LAMBDA
         SourceDetails:
