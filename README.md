@@ -7,7 +7,7 @@ The code in this repository helps you set up the following target architecture.
 
 ![Target Architecture](./target-architecture.png)
 
-For prerequisites and instructions for using this AWS Prescriptive Guidance pattern, see [Automatically audit AWS security groups that allow access from public IP addresses](https://apg-library.amazonaws.com/content-viewer/author/caa8013b-3578-434b-b2c0-5ca7faf45d2d](https://docs.aws.amazon.com/prescriptive-guidance/latest/patterns/audit-security-groups-access-public-ip.html).
+For prerequisites and instructions for using this AWS Prescriptive Guidance pattern, see [Automatically audit AWS security groups that allow access from public IP addresses](https://docs.aws.amazon.com/prescriptive-guidance/latest/patterns/audit-security-groups-access-public-ip.html).
 
 ## Security
 
